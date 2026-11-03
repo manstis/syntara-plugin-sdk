@@ -3,7 +3,7 @@
 This workspace is the local confirmation evidence for subworkflow composition
 step types (AAP-95476 / ANSTRAT-2347). It shows that both sides of a
 parent-child workflow call are expressible with the existing `v1alpha1`
-contracts, with no new Step category and no schema change.
+contracts, with no new step type category and no schema change.
 
 | Target | Kind | Role |
 | --- | --- | --- |
@@ -48,6 +48,6 @@ uv run --no-sync pytest examples/subworkflow-composition -q
 ```
 
 The tests validate all three manifests against the canonical contract bundle,
-execute each step on the direct and container paths, prove the trigger's event
-payload satisfies the terminal step's declared input, and chain the child's
-steps to show the parent receives exactly the result it declares.
+execute each type on the direct and container paths, prove the trigger's event
+payload satisfies the terminal step type's declared input, and chain the child's
+step type to show the parent receives exactly the result it declares.
