@@ -527,7 +527,9 @@ Follow these rules in every implementation:
 The `context` argument is an `ExecutionContext`. It carries the
 `invocation_id`, an optional `workflow_run_id`, bounded non-secret
 `runtime_context` data, and a `cancelled` flag for cooperative cancellation.
-It exposes no credentials and no transport types. Check `context.cancelled`
+It exposes no transport types. Any custom-runner step type can request its declared credential
+through `context.credential(name)`; see [credential access](runtime-and-oci.md#credential-access).
+Check `context.cancelled`
 before a long or irreversible operation, and stop with a `CANCELLED` failure
 when it is `True`.
 

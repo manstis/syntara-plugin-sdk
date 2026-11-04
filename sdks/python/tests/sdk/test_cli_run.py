@@ -3353,7 +3353,7 @@ def test_source_mode_warns_the_credential_path_is_not_the_production_mount(
     captured = capsys.readouterr()
     assert "delivers credential files at a temporary path" in captured.err
     assert "/var/run/syntara/secrets" in captured.err
-    assert "invocation.credential_file_paths" in captured.err
+    assert "context.credential(name).read()" in captured.err
 
 
 def test_a_target_without_an_integration_type_reaches_no_credential(
@@ -3567,9 +3567,8 @@ def test_delivered_credential_values_read_back_as_output_are_scrubbed(
 ) -> None:
     """A Step that reads the delivered file and returns it cannot leak it.
 
-    The step-side accessor is a later story, so the handler wrapper stands in
-    for it: it reads the delivered file exactly as the Step eventually will
-    and returns the document — a string and a non-string field alike — as
+    The handler wrapper reads the delivered document and returns its fields —
+    a string and a non-string field alike — as
     the Step's output. The delivered values themselves, not look-alike
     constants, are what the scrub machinery must catch.
     """
@@ -3733,6 +3732,21 @@ def test_an_overlong_credential_name_is_refused_as_usage(
     captured = capsys.readouterr()
     assert "cannot be delivered as a credential file" in captured.err
     assert "ENAMETOOLONG" in captured.err
+
+
+def test_loaded_credential_repr_hides_document_and_secret_values() -> None:
+    from syntara_plugin.sdk.runner import LoadedCredential
+
+    credential = LoadedCredential(
+        name=_RECIPE,
+        document={"token": _TOKEN, "pin": 739251},
+        secret_values=(_TOKEN,),
+        secret_scalars=(739251,),
+    )
+    rendered = repr(credential)
+    assert _TOKEN not in rendered
+    assert "739251" not in rendered
+    assert _RECIPE in rendered
 
 
 def test_a_credential_file_write_failure_is_a_structured_error(monkeypatch) -> None:

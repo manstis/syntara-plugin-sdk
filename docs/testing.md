@@ -37,10 +37,23 @@ Their names are public API.
 | `mock_execution_context` | `ExecutionContext` | `mock_execution_context(invocation_id=..., workflow_run_id=..., runtime_context=..., cancelled=False)` builds one locally approved context: valid, free of real credentials, authorized only for local test execution. |
 | `step_bindings` | `StepBindings` + contract drift validation | `bind(step)` for any step type (a locally installed manifest verified with `check_step_contract`); `bind_step(entry_point, workspace=...)` for custom-runner step types (compile, install, drift-check); `resolve(identity_or_entry_point)` returns a ready binding. |
 
-Action-category step types execute only through an installed manifest: the SDK's
+Custom-runner step types execute only through an installed manifest: the SDK's
 `require_executable_contract` provenance gate rejects fabricated descriptors,
 so `bind_step` is the only path to an executable custom-runner step type binding. Binding an
-Action with `bind` is allowed for drift checks but is not executable.
+Action, Control, or Trigger with `bind` is allowed for drift checks but is not executable.
+
+## Testing credentials
+
+`build_execution_context` and `mock_execution_context` accept
+`credential_file_paths={recipe_id: str(path)}` and `credential_directory=path`.
+Use a private temporary directory and fake JSON credential documents. The path
+must be directly inside that directory. Bind the step type with `bind_step` so its
+compiled integration and recipe declarations authorize the identifier. The
+same context works with `invoke_step` and `invoke_step_in_container`; the latter
+passes only paths over its loopback ABI. Custom in-process providers are accepted
+by the direct path when they implement the restricted provider contract described
+in [credential access](runtime-and-oci.md#credential-access); the container helper
+requires `FileCredentialProvider`.
 
 ## Invocation helpers
 
@@ -114,7 +127,11 @@ exceptions that produce a container failure.
 `VALID_INPUT_CASES` retains the historical `valid_credential_reference` entry
 for compatibility. Despite its legacy name, it passes a fixed synthetic value
 through the ordinary `api_token` input field; it does not test credential
-delivery or access. That coverage belongs to AAP-95450.
+delivery or access. `CREDENTIAL_REFERENCE_CASES` separately holds only an
+opaque credential binding name and non-secret step inputs. The reference suite
+installs that binding with a recipe, supplies a synthetic credential through
+the approved local file provider, and compares direct and container outcomes,
+including status, status message, output, and error envelope.
 
 ```python
 import logging
@@ -162,8 +179,9 @@ credentials.
 
 Credential values must not appear in outputs, wrapper fields, raised errors,
 or logs. `assert_no_secrets` detects leaks in both outcomes and captured logs;
-it does not sanitize them. Keep secrets out of exception text and log messages
-on both invocation paths.
+it does not sanitize them. SDK-generated diagnostics avoid credential values, but
+the SDK does not redact records emitted by step code. Authors must keep returned
+credentials out of their exception text and log messages on both invocation paths.
 
 Use `secret_sentinel()` to create a synthetic value for a leak assertion. This
 is separate from credential delivery. The current step-facing `ExecutionContext`

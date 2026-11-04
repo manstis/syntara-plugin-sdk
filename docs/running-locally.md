@@ -256,11 +256,9 @@ in production.
   ABI's approved secret mount. Nothing is copied into the image.
 - **source mode** runs the step type in this process, which cannot write under
   `/var/run` without privilege, so the file stays in that private directory
-  and its real path crosses the loopback ABI. Step type code must read the path
-  it
-  is given (`invocation.credential_file_paths`), not the production mount
-  path: code that hard-codes `/var/run/syntara/secrets/...` finds no
-  credential here, and the run prints a warning saying so. This one
+  and its real path crosses the loopback ABI. The Step uses
+  `context.credential(name).read()` in both modes; it does not need to know
+  either path. This one
   in-process transport is told to accept that directory; every other client
   and runtime keeps the production rule. See the
   [local credential delivery ADR](../.sdlc/adrs/0009-local-credential-delivery.md).
@@ -289,12 +287,8 @@ boolean is masked too. They are scrubbed from the
 report, `--json`, errors, hints, progress, step output, and tracebacks
 exactly as a sensitive input is.
 
-Two limits are worth knowing. `--credential` cannot be combined with
-`--address` or the `--tls-*` options: that runtime is yours, and the command
-cannot mount anything into it. And the step type implementation cannot yet
-*read* what is delivered — the typed credential accessor is a separate story,
-so today the file arrives at the documented path and nothing in the SDK hands
-that path to step type code.
+`--credential` cannot be combined with `--address` or the `--tls-*` options:
+that runtime is yours, and the command cannot mount anything into it.
 
 ## Execution modes
 
