@@ -12,7 +12,7 @@ from syntara_plugin.contracts import (
     canonical_json_digest,
 )
 
-from .abi import FailureCode
+from .abi import ContainerInvocationError, FailureCode
 from .bindings import (
     StepBinding,
     StepBindingError,
@@ -216,6 +216,11 @@ class StepExecutor:
                 status_code=error.status_code,
                 status_message=error.status_message,
             )
+        except ContainerInvocationError:
+            # A deliberate terminal failure keeps its code, message,
+            # retryability, and outcome; the container service and direct
+            # callers report it unchanged.
+            raise
         except Exception as error:
             unexpected_step_error = "".join(traceback.format_exception(error)).rstrip()
         if unexpected_step_error is not None:
@@ -307,9 +312,12 @@ def _invoke_with_error_schema(
     """Invoke one step type through its trusted descriptor and schema contract.
 
     Invalid inputs and author-raised ``StepFailure`` values produce wrappers.
-    SDK failures, including invalid output, an untrusted binding, digest mismatch,
-    or unexpected exceptions, raise
-    ``StepExecutionError`` and therefore have no wrapper.
+    An author-raised ``ContainerInvocationError`` propagates unchanged as a
+    deliberate terminal failure. After a credential read it is sanitized:
+    a leaking message or provider code degrades to a safe execution error,
+    and a leaking detail is dropped. SDK failures, including invalid
+    output, an untrusted binding, digest mismatch, or unexpected
+    exceptions, raise ``StepExecutionError`` and therefore have no wrapper.
     """
 
     untrusted_binding = False
@@ -342,18 +350,26 @@ def _execute_scoped(
 ) -> StandardOutputWrapper[Mapping[str, Any]]:
     execution_error: StepExecutionError | None = None
     unexpected_error: BaseException | None = None
+    caught_terminal: ContainerInvocationError | None = None
     wrapper: StandardOutputWrapper[Mapping[str, Any]] | None = None
     try:
         _validate_context_output_digest(step, context)
         wrapper = executor.execute(input, context)
     except StepExecutionError as error:
         execution_error = error
+    except ContainerInvocationError as error:
+        caught_terminal = error
     except Exception as error:
         unexpected_error = error
     except BaseException as error:
         if not scope.has_read:
             raise
         unexpected_error = error
+    if caught_terminal is not None:
+        # Sanitized and raised outside the handler: running the sanitizer
+        # while the original is still active would retain it as
+        # ``__context__`` if a mutated field fails reconstruction.
+        raise _scoped_terminal_failure(caught_terminal, scope)
     if unexpected_error is not None:
         _raise_unexpected_scoped_error(unexpected_error, scope)
     if execution_error is not None:
@@ -405,11 +421,61 @@ def _raise_unexpected_scoped_error(error: BaseException, scope: _CredentialScope
     ) from None
 
 
-def _raise_credential_scan_limit() -> None:
-    raise StepExecutionError(
+def _credential_scan_limit_error() -> StepExecutionError:
+    return StepExecutionError(
         _CREDENTIAL_SCAN_LIMIT,
         failure_code=FailureCode.CREDENTIAL_SCAN_LIMIT,
-    ) from None
+    )
+
+
+def _raise_credential_scan_limit() -> None:
+    raise _credential_scan_limit_error() from None
+
+
+def _scoped_terminal_failure(
+    error: ContainerInvocationError, scope: _CredentialScope
+) -> ContainerInvocationError | StepExecutionError:
+    """Return the sanitized terminal failure to raise for ``error``.
+
+    The message and the provider code are the free-text fields a terminal
+    failure carries across the container ABI, and the original's detail and
+    exception chain stay reachable to in-process callers; none of them may
+    carry a credential after a read. Both ABI fields are checked and a leak
+    in either degrades to a safe execution error exactly like a leaking
+    wrapper, a leaking detail is dropped, and the returned failure is
+    reconstructed without the original chain. A field mutated after
+    construction fails reconstruction and degrades the same way. The caller
+    sanitizes and raises outside the ``except`` handler so the original is
+    never retained as its ``__context__``.
+    """
+    if not scope.has_read:
+        return error
+    for abi_field in (error.safe_message, error.provider_code):
+        scan_status = scope.scan(abi_field)
+        if scan_status is _CredentialScanStatus.LIMIT_EXCEEDED:
+            return _credential_scan_limit_error()
+        if scan_status is _CredentialScanStatus.SECRET_FOUND:
+            return StepExecutionError(_INVALID_STEP_RESPONSE)
+    safe_detail = error.detail
+    if safe_detail is not None:
+        scan_status = scope.scan(safe_detail)
+        if scan_status is _CredentialScanStatus.LIMIT_EXCEEDED:
+            return _credential_scan_limit_error()
+        if scan_status is _CredentialScanStatus.SECRET_FOUND:
+            safe_detail = None
+    try:
+        return ContainerInvocationError(
+            error.code,
+            error.safe_message,
+            retryable=error.retryable,
+            outcome=error.outcome,
+            provider_code=error.provider_code,
+            detail=safe_detail,
+        )
+    except (TypeError, ValueError):
+        # A field mutated after construction no longer reconstructs; treat
+        # the failure like any other invalid step output.
+        return StepExecutionError(_INVALID_STEP_RESPONSE)
 
 
 def _reject_credential_output(

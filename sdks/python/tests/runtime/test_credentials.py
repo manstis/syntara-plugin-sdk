@@ -16,6 +16,10 @@ import syntara_plugin.runtime.credentials as credentials_module
 from pydantic import BaseModel, ValidationError
 from syntara_plugin.runtime import (
     ActionStep,
+    ContainerInvocation,
+    ContainerInvocationError,
+    ContainerRemoteError,
+    ContainerRuntimeService,
     ControlStep,
     CredentialAccessError,
     CredentialBinding,
@@ -31,9 +35,12 @@ from syntara_plugin.runtime import (
     StepExecutionError,
     StepExecutor,
     StepFailure,
+    StepRegistry,
     TriggerStep,
+    container_step_for_binding,
     invoke,
 )
+from syntara_plugin.runtime.container import _request_from_invocation
 from syntara_plugin.testing import build_execution_context, invoke_step, invoke_step_in_container
 
 _SECRET = "sample-credential-value-keep-private"
@@ -87,6 +94,46 @@ class CredentialStep(ActionStep[CredentialInput, CredentialOutput]):
                 credential = handle.read()
             if inputs.mode == "exception":
                 raise ValueError(str(credential["token"]))
+            if inputs.mode == "terminal_failure":
+                raise ContainerInvocationError(
+                    FailureCode.REMOTE_REJECTED,
+                    "The tracker rejected the request.",
+                    retryable=True,
+                    outcome="not_completed",
+                    provider_code="tracker",
+                )
+            if inputs.mode == "terminal_failure_leak":
+                raise ContainerInvocationError(
+                    FailureCode.REMOTE_REJECTED,
+                    f"token={credential['token']}",
+                    retryable=True,
+                    outcome="not_completed",
+                )
+            if inputs.mode == "terminal_failure_provider_leak":
+                raise ContainerInvocationError(
+                    FailureCode.REMOTE_REJECTED,
+                    "The tracker rejected the request.",
+                    retryable=True,
+                    outcome="not_completed",
+                    provider_code=str(credential["token"]),
+                ) from ValueError(str(credential["token"]))
+            if inputs.mode == "terminal_failure_detail_leak":
+                raise ContainerInvocationError(
+                    FailureCode.REMOTE_REJECTED,
+                    "The tracker rejected the request.",
+                    retryable=True,
+                    outcome="not_completed",
+                    detail=f"provider said: {credential['token']}",
+                ) from ValueError(f"upstream failed: {credential['token']}")
+            if inputs.mode == "terminal_failure_mutated":
+                failure = ContainerInvocationError(
+                    FailureCode.REMOTE_REJECTED,
+                    "The tracker rejected the request.",
+                    retryable=True,
+                    outcome="not_completed",
+                )
+                failure.provider_code = "Not A Code!"
+                raise failure from ValueError(f"upstream failed: {credential['token']}")
             if inputs.mode == "system_exit":
                 raise SystemExit(credential["token"])
             if inputs.mode == "keyboard_interrupt":
@@ -298,6 +345,201 @@ def test_denied_missing_file_and_secret_leaks_are_safe(tmp_path: Path) -> None:
         with pytest.raises(StepExecutionError) as error:
             invoke(binding, {"mode": mode}, context)
         assert _SECRET not in str(error.value)
+
+
+class _ServicerContext:
+    def add_callback(self, callback: Any) -> bool:
+        del callback
+        return True
+
+
+def _terminal_failure_event(
+    binding: StepBinding, inputs: Mapping[str, Any], credential_path: Path, root: Path
+) -> Any:
+    """Run one invocation against the real sync service and return its event."""
+
+    invocation = ContainerInvocation(
+        invocation_id="terminal-leak-probe",
+        workflow_run_id="terminal-leak-probe-run",
+        step_revision_id=binding.descriptor.step_identity,
+        inputs=dict(inputs),
+        credential_file_paths={_NAME: str(credential_path)},
+        timeout_seconds=30,
+        runtime_context={},
+    )
+    service = ContainerRuntimeService(
+        StepRegistry({binding.descriptor.step_identity: container_step_for_binding(binding)}),
+        root,
+    )
+    request = _request_from_invocation(invocation, root)
+    return next(service.Execute(request, _ServicerContext()))
+
+
+def test_a_terminal_failure_after_a_read_keeps_its_fields(tmp_path: Path) -> None:
+    """The credential scan must not degrade a clean deliberate terminal failure."""
+
+    path = tmp_path / "credential"
+    path.write_text(json.dumps({"token": _SECRET}))
+    context = build_execution_context(
+        credential_file_paths={_NAME: str(path)}, credential_directory=tmp_path,
+    )
+    direct = invoke_step(_binding(), {"mode": "terminal_failure"}, context=context)
+    assert isinstance(direct.raised, ContainerInvocationError)
+    assert direct.raised.code is FailureCode.REMOTE_REJECTED
+    assert direct.raised.safe_message == "The tracker rejected the request."
+    assert direct.raised.retryable is True
+    assert direct.raised.outcome == "not_completed"
+    assert direct.raised.provider_code == "tracker"
+    container = invoke_step_in_container(
+        _binding(), {"mode": "terminal_failure"}, context=context
+    )
+    assert isinstance(container.raised, ContainerRemoteError)
+    assert container.raised.source == "workload"
+    assert container.raised.code is FailureCode.REMOTE_REJECTED
+    assert container.raised.message == "The tracker rejected the request."
+    assert container.raised.retryable is True
+    assert container.raised.outcome == "not_completed"
+    assert container.raised.provider_code == "tracker"
+    event = _terminal_failure_event(_binding(), {"mode": "terminal_failure"}, path, tmp_path)
+    assert event.WhichOneof("event") == "failure"
+    assert event.failure.code == "REMOTE_REJECTED"
+    assert event.failure.provider_code == "tracker"
+    assert _SECRET not in str(event)
+
+
+def test_a_terminal_failure_provider_code_cannot_leak_a_read_credential(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "credential"
+    path.write_text(json.dumps({"token": _SECRET}))
+    context = build_execution_context(
+        credential_file_paths={_NAME: str(path)}, credential_directory=tmp_path,
+    )
+    outcomes = (
+        invoke_step(_binding(), {"mode": "terminal_failure_provider_leak"}, context=context),
+        invoke_step_in_container(
+            _binding(), {"mode": "terminal_failure_provider_leak"}, context=context
+        ),
+    )
+    for outcome in outcomes:
+        assert not outcome.ok
+        assert outcome.raw is None
+        code = (
+            outcome.raised.failure_code
+            if isinstance(outcome.raised, StepExecutionError)
+            else outcome.raised.code
+        )
+        assert code is FailureCode.ABI_VIOLATION
+        assert _SECRET not in repr(outcome)
+        assert _SECRET not in str(outcome.raised)
+        assert _SECRET not in "".join(traceback.format_exception(outcome.raised))
+        if isinstance(outcome.raised, StepExecutionError):
+            # The degraded failure must not retain the original, whose
+            # provider code and cause carry the credential, as its context.
+            assert outcome.raised.__context__ is None
+    event = _terminal_failure_event(
+        _binding(), {"mode": "terminal_failure_provider_leak"}, path, tmp_path
+    )
+    assert event.WhichOneof("event") == "failure"
+    assert event.failure.code == "ABI_VIOLATION"
+    assert _SECRET not in str(event)
+
+
+def test_a_terminal_failure_detail_and_chain_cannot_leak_a_read_credential(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "credential"
+    path.write_text(json.dumps({"token": _SECRET}))
+    context = build_execution_context(
+        credential_file_paths={_NAME: str(path)}, credential_directory=tmp_path,
+    )
+    direct = invoke_step(_binding(), {"mode": "terminal_failure_detail_leak"}, context=context)
+    assert isinstance(direct.raised, ContainerInvocationError)
+    assert direct.raised.code is FailureCode.REMOTE_REJECTED
+    assert direct.raised.safe_message == "The tracker rejected the request."
+    assert direct.raised.retryable is True
+    assert direct.raised.outcome == "not_completed"
+    assert direct.raised.detail is None
+    assert direct.raised.__cause__ is None
+    # The sanitized failure must not retain the original, whose detail and
+    # cause carry the credential, as its context.
+    assert direct.raised.__context__ is None
+    assert _SECRET not in "".join(traceback.format_exception(direct.raised))
+    container = invoke_step_in_container(
+        _binding(), {"mode": "terminal_failure_detail_leak"}, context=context
+    )
+    assert isinstance(container.raised, ContainerRemoteError)
+    assert container.raised.code is FailureCode.REMOTE_REJECTED
+    assert container.raised.message == "The tracker rejected the request."
+    assert _SECRET not in repr(container)
+    event = _terminal_failure_event(
+        _binding(), {"mode": "terminal_failure_detail_leak"}, path, tmp_path
+    )
+    assert event.WhichOneof("event") == "failure"
+    assert event.failure.code == "REMOTE_REJECTED"
+    assert _SECRET not in str(event)
+
+
+def test_a_mutated_terminal_failure_degrades_safely_after_a_read(
+    tmp_path: Path,
+) -> None:
+    """A field mutated after construction cannot leak through reconstruction.
+
+    The mutated provider code fails the reconstructed failure's validation;
+    the safe degradation must not retain the original, whose cause carries
+    the credential, as its context or formatted traceback.
+    """
+
+    path = tmp_path / "credential"
+    path.write_text(json.dumps({"token": _SECRET}))
+    context = build_execution_context(
+        credential_file_paths={_NAME: str(path)}, credential_directory=tmp_path,
+    )
+    direct = invoke_step(_binding(), {"mode": "terminal_failure_mutated"}, context=context)
+    assert isinstance(direct.raised, StepExecutionError)
+    assert direct.raised.failure_code is FailureCode.ABI_VIOLATION
+    assert direct.raised.__context__ is None
+    assert _SECRET not in str(direct.raised)
+    assert _SECRET not in "".join(traceback.format_exception(direct.raised))
+    container = invoke_step_in_container(
+        _binding(), {"mode": "terminal_failure_mutated"}, context=context
+    )
+    assert isinstance(container.raised, ContainerRemoteError)
+    assert container.raised.code is FailureCode.ABI_VIOLATION
+    assert _SECRET not in repr(container)
+    event = _terminal_failure_event(
+        _binding(), {"mode": "terminal_failure_mutated"}, path, tmp_path
+    )
+    assert event.WhichOneof("event") == "failure"
+    assert event.failure.code == "ABI_VIOLATION"
+    assert _SECRET not in str(event)
+
+
+def test_a_terminal_failure_message_cannot_leak_a_read_credential(tmp_path: Path) -> None:
+    path = tmp_path / "credential"
+    path.write_text(json.dumps({"token": _SECRET}))
+    context = build_execution_context(
+        credential_file_paths={_NAME: str(path)}, credential_directory=tmp_path,
+    )
+    outcomes = (
+        invoke_step(_binding(), {"mode": "terminal_failure_leak"}, context=context),
+        invoke_step_in_container(
+            _binding(), {"mode": "terminal_failure_leak"}, context=context
+        ),
+    )
+    for outcome in outcomes:
+        assert not outcome.ok
+        assert outcome.raw is None
+        code = (
+            outcome.raised.failure_code
+            if isinstance(outcome.raised, StepExecutionError)
+            else outcome.raised.code
+        )
+        assert code is FailureCode.ABI_VIOLATION
+        assert _SECRET not in repr(outcome)
+        assert _SECRET not in str(outcome.raised)
+        if isinstance(outcome.raised, StepExecutionError):
+            assert outcome.raised.__context__ is None
 
 
 def test_file_provider_refuses_unapproved_and_symlink_paths(tmp_path: Path) -> None:

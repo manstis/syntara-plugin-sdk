@@ -8,8 +8,14 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from syntara_plugin.runtime import ControlStep, ExecutionContext, FailureCode, StepExecutionError
-from syntara_plugin.runtime.container import ContainerInvocationError, ContainerRemoteError
+from syntara_plugin.runtime import (
+    ContainerInvocationError,
+    ControlStep,
+    ExecutionContext,
+    FailureCode,
+    StepExecutionError,
+)
+from syntara_plugin.runtime.container import ContainerRemoteError
 from syntara_plugin.testing import (
     INVALID_INPUT_CASES,
     assert_no_secrets,
@@ -39,6 +45,7 @@ class TerminalFailureStep(ReferenceControlStep):
             FailureCode.UPSTREAM_TRANSIENT,
             "The upstream service is temporarily unavailable.",
             retryable=True,
+            provider_code="upstream",
         )
 
 
@@ -178,10 +185,20 @@ def test_terminal_failures_are_equivalent_as_raised_failures() -> None:
     container = invoke_step_in_container(TerminalFailureStep(), {"title": "x"}, context=context)
 
     assert_outcomes_equivalent(direct, container)
-    assert isinstance(direct.raised, StepExecutionError)
-    assert direct.raised.failure_code is FailureCode.OUTCOME_UNKNOWN
+    # A deliberate terminal failure keeps its code, message, retryability, and
+    # outcome on both paths instead of degrading to OUTCOME_UNKNOWN.
+    assert isinstance(direct.raised, ContainerInvocationError)
+    assert direct.raised.code is FailureCode.UPSTREAM_TRANSIENT
+    assert direct.raised.retryable is True
+    assert direct.raised.safe_message == "The upstream service is temporarily unavailable."
+    assert direct.raised.provider_code == "upstream"
     assert isinstance(container.raised, ContainerRemoteError)
-    assert container.raised.code is FailureCode.OUTCOME_UNKNOWN
+    assert container.raised.source == "workload"
+    assert container.raised.code is FailureCode.UPSTREAM_TRANSIENT
+    assert container.raised.retryable is True
+    assert container.raised.outcome == "not_completed"
+    assert container.raised.message == "The upstream service is temporarily unavailable."
+    assert container.raised.provider_code == "upstream"
     assert direct.raw is None
     assert container.raw is None
 
